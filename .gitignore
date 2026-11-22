@@ -3,6 +3,8 @@ node_modules/
 .wrangler-dryrun/
 .dev.vars
 .env
+hf-space/.env
+cf-pages/.env
 paper2product/.env
 paper2product/data/
 paper2product/.venv/
