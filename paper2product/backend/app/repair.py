@@ -93,10 +93,8 @@ def llm_patch(diag: Diagnosis, files: dict[str, str], stderr: str, stdout: str, 
     target = diag.file
     if not target:
         return None
-    prompt = ("A generated project failed. Propose ONE minimal fix to ONE non-test file. Never edit tests or weaken assertions. "
-              'Return JSON {"file": "...", "content": "<full new file content>", "rationale": "..."}.\n'
-              f"DIAGNOSIS: {diag.to_dict()}\nLOG:\n{redact(stderr)[-3000:]}\n{redact(stdout)[-1500:]}\n"
-              f"FILE {target}:\n{files[target]}")
+    from .llm import prompts
+    prompt = prompts.repair_prompt(diag.to_dict(), redact(stderr)[-3000:] + "\n" + redact(stdout)[-1500:], target, files[target])
     d = provider.generate_json(prompt)
     if not isinstance(d.get("file"), str) or not isinstance(d.get("content"), str):
         return None

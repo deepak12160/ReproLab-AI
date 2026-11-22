@@ -9,6 +9,10 @@ from typing import Any, Optional
 
 TASK_TYPES = {"classification", "regression", "clustering", "unknown"}
 REPRO_STATUSES = {"reproduced", "partially_reproduced", "not_reproduced", "unable_to_verify"}
+# How a piece of information is known (shown next to every extracted claim in the UI and the report).
+PROVENANCE = ("explicit", "derived", "user_provided", "assumed", "not_reported")
+PROVENANCE_LABEL = {"explicit": "Explicitly stated in the paper", "derived": "Derived from the paper",
+                    "user_provided": "User-provided", "assumed": "Assumed", "not_reported": "Not reported"}
 
 
 class SchemaError(ValueError):
@@ -33,6 +37,29 @@ def _strlist(d: dict, k: str) -> list[str]:
     return [x.strip() for x in v if x.strip()]
 
 
+def _evidence_list(v) -> list[dict]:
+    out = []
+    for e in (v or []) if isinstance(v, list) else []:
+        if not isinstance(e, dict):
+            continue
+        page = e.get("page")
+        try:
+            page = int(page) if page not in (None, "") else None
+        except (TypeError, ValueError):
+            page = None
+        label = str(e.get("label", "explicit"))
+        out.append({"field": str(e.get("field", ""))[:40], "key": str(e.get("key", ""))[:80],
+                    "excerpt": str(e.get("excerpt", ""))[:400], "page": page,
+                    "label": label if label in PROVENANCE else "explicit"})
+    return out
+
+
+def _provenance_map(v) -> dict[str, str]:
+    if not isinstance(v, dict):
+        return {}
+    return {str(k): str(x) for k, x in v.items() if str(x) in PROVENANCE}
+
+
 @dataclass
 class ReportedResult:
     metric: str
@@ -41,6 +68,9 @@ class ReportedResult:
     split: str = ""
     page: Optional[int] = None
     note: str = ""
+    variant: str = ""                  # table row / system the number belongs to (e.g. a baseline), "" = unspecified
+    excerpt: str = ""                  # source text the number was read from
+    provenance: str = "explicit"       # see PROVENANCE
 
     @classmethod
     def from_dict(cls, d: dict) -> "ReportedResult":
@@ -56,7 +86,11 @@ class ReportedResult:
         page = d.get("page")
         if page is not None and not isinstance(page, int):
             raise SchemaError("'page' must be an integer")
-        return cls(metric, value, _str(d, "dataset"), _str(d, "split"), page, _str(d, "note"))
+        prov = _str(d, "provenance", "explicit") or "explicit"
+        if prov not in PROVENANCE:
+            raise SchemaError(f"'provenance' must be one of {list(PROVENANCE)}")
+        return cls(metric, value, _str(d, "dataset"), _str(d, "split"), page, _str(d, "note"),
+                   _str(d, "variant"), _str(d, "excerpt"), prov)
 
 
 @dataclass
@@ -81,6 +115,14 @@ class ResearchSpec:
     page_refs: dict[str, list[int]] = field(default_factory=dict)
     security_flags: list[str] = field(default_factory=list)
     extraction_method: str = "unknown"
+    # --- grounding / review support ---
+    baselines: list[str] = field(default_factory=list)
+    splits: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    ambiguities: list[str] = field(default_factory=list)          # free-text uncertainties noted by the extractor
+    evidence: list[dict] = field(default_factory=list)            # [{field,key,excerpt,page,label}]
+    provenance: dict[str, str] = field(default_factory=dict)      # field -> PROVENANCE label
+    validation_issues: list[str] = field(default_factory=list)    # things removed/moved by the field validators
 
     def validate(self) -> "ResearchSpec":
         if not self.title:
@@ -119,6 +161,11 @@ class ResearchSpec:
             page_refs={str(k): [int(p) for p in v] for k, v in refs.items()},
             security_flags=_strlist(d, "security_flags"),
             extraction_method=_str(d, "extraction_method", "unknown"),
+            baselines=_strlist(d, "baselines"), splits=_strlist(d, "splits"),
+            dependencies=_strlist(d, "dependencies"), ambiguities=_strlist(d, "ambiguities"),
+            evidence=_evidence_list(d.get("evidence")),
+            provenance=_provenance_map(d.get("provenance")),
+            validation_issues=_strlist(d, "validation_issues"),
         )
         return spec.validate()
 
@@ -151,6 +198,11 @@ class Plan:
     open_questions: list[str]
     feasible: bool = True
     infeasible_reason: str = ""
+    reproduction_type: str = "approximate"   # exact | approximate | partial (see planner.classify_reproduction)
+    reproduction_type_reason: str = ""
+    spec_sha256: str = ""                    # hash of the approved spec this plan was built from
+    blockers: list[str] = field(default_factory=list)
+    compute_needs: str = ""
 
     def validate(self) -> "Plan":
         ids = {t.id for t in self.tasks}

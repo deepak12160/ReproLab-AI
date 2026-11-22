@@ -226,22 +226,74 @@ def generate_template_project(spec: ResearchSpec, plan: Plan, inject_fault: bool
     return validate_file_map(files)
 
 
-def generate_llm_project(spec: ResearchSpec, plan: Plan, provider, dataset: dict | None = None) -> dict[str, str]:
-    prompt = (
-        "Generate a complete Python project implementing the method below faithfully (do not substitute an easier "
-        "algorithm). Return JSON {\"files\": {\"relative/path.py\": \"content\"}, \"assumptions\": [...]}. "
-        "Requirements: package directory + tests/ using unittest, config.json, requirements.txt, README.md, "
-        "run_experiment.py that writes artifacts/predictions.json with keys y_true, y_pred, labels, "
-        "artifacts/run_meta.json with dataset, seed, test_size. No network access, no subprocess, no eval/exec, "
-        "no file access outside the project directory. Use ONLY numpy, scikit-learn and the standard library. "
-        "For data use the bundled scikit-learn loader described in DATASET (e.g. sklearn.datasets.load_wine()); "
-        "never download anything. Use a seeded, stratified train/test split and write predictions for the TEST split only. "
-        "run_experiment.py must be runnable as `python run_experiment.py` from the project root and read files with "
-        "encoding='utf-8'. tests/ must contain tests/__init__.py and run with `python -m unittest discover -s tests -t .`.\n"
-        f"DATASET: {json.dumps(dataset or {})[:1500]}\n"
-        f"SPEC: {json.dumps(spec.to_dict())[:12000]}\nPLAN: {json.dumps(plan.to_dict())[:4000]}")
-    d = provider.generate_json(prompt)
-    files = validate_file_map(d.get("files", {}))
+def generate_llm_project(spec: ResearchSpec, plan: Plan, provider, dataset: dict | None = None,
+                         progress=None, only_missing: list[str] | None = None,
+                         initial_files: dict[str, str] | None = None) -> dict[str, str]:
+    from .llm import prompts
+    prompt = prompts.codegen_prompt(spec.to_dict(), plan.to_dict(), dataset)
+    if dataset and dataset.get("user_supplied"):
+        prompt += (f"\nThe dataset is a user-supplied CSV at data/{dataset['name']} (header row; the LAST column is the label; "
+                   "read it with the csv module and numpy - pandas is not available). Do not use sklearn loaders.")
+    if getattr(provider, "is_mock", False):
+        d = provider.generate_json(prompt)
+        files = validate_file_map(d.get("files", {}))
+    else:
+        spec_json = json.dumps(spec.to_dict(), default=str)
+        plan_json = json.dumps(plan.to_dict(), default=str)
+        dataset_json = json.dumps(dataset or {}, default=str)
+        base = (
+            "Return one JSON object: {\"files\":{\"relative/path\":\"content\"}}. "
+            "Do not use PyTorch or TensorFlow. Use only NumPy, scikit-learn and the standard library. "
+            "Keep the response small and complete the requested files only.\n"
+            f"SPEC: {spec_json[:8000]}\nPLAN: {plan_json[:3000]}\nDATASET: {dataset_json[:1500]}\n"
+        )
+        chunks = [
+            ("model implementation", base + "Generate the core model implementation and package initializer. "
+             "Use one package directory. Implement the method described in SPEC; do not substitute an ordinary model."),
+            ("dataset and experiment runner", base + "Generate data loading and run_experiment.py. "
+             "For a user CSV use csv/numpy with the last column as label. Write artifacts/predictions.json "
+             "and artifacts/run_meta.json."),
+            ("unit tests", base + "Generate tests/__init__.py and tests/test_*.py using unittest only. "
+             "Test shapes, invalid input, deterministic behavior and at least one accuracy or regression invariant."),
+            ("configuration and documentation", base + "Generate config.json, experiment_metadata.json, "
+             "requirements.txt and README.md. Record assumptions and the exact rerun commands."),
+        ]
+        request_timeout = getattr(provider, "request_timeout", None)
+        files = dict(initial_files or {})
+        for label, chunk_prompt in chunks:
+            key = label
+            if only_missing is not None and key not in only_missing:
+                continue
+            if progress:
+                progress(f"Generating {label} (small code-generation call)...")
+            try:
+                if callable(request_timeout):
+                    with request_timeout(240, retries=0, fallback=False):
+                        d = provider.generate_json(chunk_prompt)
+                else:
+                    d = provider.generate_json(chunk_prompt)
+            except Exception as e:
+                from .llm.provider import LLMOutputError
+                if isinstance(e, LLMOutputError):
+                    raise LLMOutputError(f"{label} chunk returned invalid JSON: {str(e).replace('model returned invalid JSON: ', '')}") from e
+                raise
+            chunk_files = validate_file_map(d.get("files", {}))
+            overlap = sorted(set(files) & set(chunk_files))
+            for path in overlap:
+                if files[path] == chunk_files[path]:
+                    continue
+                # LLM chunks can repeat scaffolding or earlier files. Preserve the
+                # first complete implementation rather than accepting replacements
+                # or a partially conflicting overwrite.
+            for path, src in chunk_files.items():
+                if path not in files:
+                    files[path] = src
+            if progress:
+                try:
+                    progress(f"Generated {label}", dict(chunk_files))
+                except TypeError:
+                    progress(f"Generated {label}")
+        files = validate_file_map(files)
     for path, src in files.items():
         if path.endswith(".py"):
             problems = scan_python(src, path)

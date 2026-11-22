@@ -56,6 +56,10 @@ class GithubExport(BaseModel):
     private: bool = True
 
 
+class DatasetChoice(BaseModel):
+    source: str = Field(min_length=3, max_length=160)
+
+
 class DemoRequest(BaseModel):
     inject_fault: bool = True
 
@@ -145,11 +149,17 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
 
     @app.post("/api/projects", status_code=202)
     async def create_project(request: Request, file: UploadFile = File(...), dataset_source: str = Form(""),
-                             max_repairs: int = Form(3), exec_timeout_s: int = Form(120), inject_fault: bool = Form(False)):
+                             max_repairs: int = Form(3), exec_timeout_s: int = Form(120), inject_fault: bool = Form(False),
+                             auto_run: bool = Form(False), dataset_file: UploadFile | None = File(None)):
         data = await file.read(settings.max_upload_mb * 1024 * 1024 + 1)
+        dataset_payload = None
+        if dataset_file is not None:
+            csv_raw = await dataset_file.read(50 * 1024 * 1024 + 1)
+            dataset_payload = (dataset_file.filename or "data.csv", csv_raw)
         pid = svc.create_project(file.filename or "paper.pdf", data,
                                  {"max_repairs": max_repairs, "exec_timeout_s": exec_timeout_s}, dataset_source,
-                                 inject_fault, client(request))
+                                 inject_fault, client(request), auto_run=auto_run,
+                                 dataset_file=dataset_payload)
         return {"id": pid}
 
     @app.post("/api/demo", status_code=202)
@@ -191,10 +201,23 @@ def create_app(settings: Settings | None = None, service: Service | None = None)
         svc.approve_plan(pid, body.accept_assumptions, client(request))
         return {"ok": True}
 
+    @app.post("/api/projects/{pid}/dataset")
+    def choose_dataset(pid: str, body: DatasetChoice, request: Request):
+        return svc.set_dataset(pid, body.source, client(request))
+
+    @app.post("/api/projects/{pid}/dataset-upload")
+    async def upload_dataset(pid: str, request: Request, file: UploadFile = File(...)):
+        data = await file.read(50 * 1024 * 1024 + 1)
+        return svc.upload_dataset(pid, file.filename or "data.csv", data, client(request))
+
     @app.post("/api/projects/{pid}/cancel")
     def cancel(pid: str):
         svc.cancel(pid)
         return {"ok": True}
+
+    @app.post("/api/projects/{pid}/resume", status_code=202)
+    def resume_project(pid: str, request: Request):
+        return svc.resume(pid, client(request))
 
     # ---- artifacts ----
     @app.get("/api/projects/{pid}/files")

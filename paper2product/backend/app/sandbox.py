@@ -120,7 +120,7 @@ class LocalSandbox:
 
     def run_python(self, workdir: str, args: list[str], timeout_s: int, memory_mb: int, max_output_kb: int) -> SandboxResult:
         args = validate_python_args(args)
-        argv = [sys.executable, "-E", "-s"] + args
+        argv = [sys.executable, "-E", "-s", "-X", "utf8"] + args
         env = self._env(workdir)
 
         def limits() -> None:               # POSIX only

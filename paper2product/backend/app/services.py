@@ -100,8 +100,9 @@ class Service:
 
     def integrations(self) -> dict:
         return {
-            "llm": ({**self.llm.info(), "configured": True} if self.llm else
-                    {"configured": False, "mode": "demo",
+            "llm": ({**self.llm.info(), "configured": True, "mode": "llm",
+                     "label": f"LLM MODE - {self.llm.info().get('provider')} / {self.llm.info().get('model', '?')}"} if self.llm else
+                    {"configured": False, "mode": "demo", "label": "DEMO MODE - no LLM configured",
                      "detail": self.llm_error or "GEMINI_API_KEY not set - running in DEMO MODE (deterministic template, no LLM reasoning)"}),
             "sandbox": {"mode": self.sandbox.mode, "isolated": self.sandbox.isolated, "detail": self.sandbox.description},
             "github": self.github.status(),
@@ -129,7 +130,8 @@ class Service:
         self.limiter.check(client)
 
     def create_project(self, filename: str, data: bytes, budget: dict | None, dataset_hint: str = "",
-                       inject_fault: bool = False, client: str = "anon") -> str:
+                       inject_fault: bool = False, client: str = "anon", is_fixture: bool = False,
+                       auto_run: bool = False, dataset_file: tuple[str, bytes] | None = None) -> str:
         self._rate(client)
         if not filename.lower().endswith(".pdf"):
             raise SchemaError("only .pdf files are accepted")
@@ -138,18 +140,67 @@ class Service:
         b = Budget.from_dict(budget)
         if dataset_hint and not re.match(r"^(sklearn:[a-z_]+|hf:[\w\-./]+|upload:[\w\-./]+)$", dataset_hint):
             raise SchemaError("dataset source must look like sklearn:iris, hf:<id> or upload:<name>")
+        if dataset_file:
+            from .integrations.datasets import safe_upload_name, resolve_upload, ResourceError
+            name, raw = dataset_file
+            try:
+                name = safe_upload_name(os.path.basename(name))
+            except ResourceError as e:
+                raise SchemaError(str(e))
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="p2p_csv_") as td:
+                path = os.path.join(td, name)
+                with open(path, "wb") as f:
+                    f.write(raw)
+                try:
+                    resolve_upload(path)
+                except ResourceError as e:
+                    raise SchemaError(str(e))
+            dataset_hint = f"upload:{name}"
+            dataset_hint_for_create = (name, raw)
+        else:
+            dataset_hint_for_create = None
         from .ingest import IngestError
         try:
-            pid = self.engine.create(os.path.splitext(os.path.basename(filename))[0][:80], data, b, dataset_hint, inject_fault)
+            pid = self.engine.create(os.path.splitext(os.path.basename(filename))[0][:80], data, b, dataset_hint,
+                                     inject_fault, is_fixture, auto_run)
         except IngestError as e:
             raise SchemaError(str(e))
+        if dataset_hint_for_create:
+            name, raw = dataset_hint_for_create
+            d = self.engine.upload_dir(pid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(raw)
         self.db.audit("project_created", "user", pid, {"filename": os.path.basename(filename), "inject_fault": inject_fault})
-        self.jobs.submit(self.engine.run_ingest, pid)
+        if auto_run:
+            self.jobs.submit(self._auto_pipeline, pid)
+        else:
+            self.jobs.submit(self.engine.run_ingest, pid)
         return pid
 
     def create_demo(self, inject_fault: bool = True, client: str = "anon") -> str:
         with open(SAMPLE_PDF, "rb") as f:
-            return self.create_project("fisher_lda_iris_fixture.pdf", f.read(), {}, "", inject_fault, client)
+            return self.create_project("fisher_lda_iris_fixture.pdf", f.read(), {}, "", inject_fault, client, is_fixture=True)
+
+    def _auto_pipeline(self, pid: str) -> None:
+        self.engine.run_ingest(pid)
+        st = self.engine.load(pid)
+        if st.degraded:
+            self.engine._log(st, "auto", "Auto-run paused at the specification gate: LLM extraction was degraded.", "warn")
+            return
+        if st.spec is None:
+            self.engine._log(st, "auto", "Auto-run paused at the specification gate: no specification was produced.", "warn")
+            return
+        self.engine.approve_spec(pid, None, actor="auto")
+        self.engine.run_plan(pid)
+        st = self.engine.load(pid)
+        plan = st.plan or {}
+        if plan.get("blockers"):
+            self.engine._log(st, "auto", "Auto-run paused at the plan gate: unresolved dataset blockers.", "warn")
+            return
+        self.engine.approve_plan(pid, True, actor="auto")
+        self.engine.run_execution(pid)
 
     def _get(self, pid: str) -> dict:
         p = self.db.get_project(pid)
@@ -188,9 +239,45 @@ class Service:
         self.engine.approve_plan(pid, accept)
         self.jobs.submit(self.engine.run_execution, pid)
 
+    def set_dataset(self, pid: str, source: str, client: str = "anon") -> dict:
+        self._get(pid); self._rate(client)
+        if not re.match(r"^(sklearn:[a-z_]+|hf:[\w\-./]+|upload:[A-Za-z0-9_.\-]+)$", source or ""):
+            raise SchemaError("dataset source must look like sklearn:iris, hf:<id> or upload:<name>")
+        return self.engine.set_dataset(pid, source)
+
+    def upload_dataset(self, pid: str, filename: str, data: bytes, client: str = "anon") -> dict:
+        from .integrations.datasets import safe_upload_name, ResourceError, MAX_UPLOAD_BYTES
+        self._get(pid); self._rate(client)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise SchemaError("dataset larger than 50 MB limit")
+        try:
+            name = safe_upload_name(os.path.basename(filename or ""))
+        except ResourceError as e:
+            raise SchemaError(str(e))
+        d = self.engine.upload_dir(pid)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        try:
+            return self.engine.set_dataset(pid, f"upload:{name}")
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+
     def cancel(self, pid: str) -> None:
         self._get(pid)
         self.engine.request_cancel(pid)
+
+    def resume(self, pid: str, client: str = "anon") -> dict:
+        self._get(pid)
+        self._rate(client)
+        self.engine.resume(pid)
+        self.jobs.submit(self.engine.run_execution, pid)
+        return {"ok": True}
 
     # ---- artifacts --------------------------------------------------------------------------
     def files(self, pid: str) -> dict:

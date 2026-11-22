@@ -56,7 +56,7 @@ class Settings:
     llm_provider: str = "auto"          # auto | gemini | demo
     llm_model: str = DEFAULT_MODEL
     llm_api_key: str = ""
-    llm_timeout_s: int = 30
+    llm_timeout_s: int = 120
     llm_max_retries: int = 1
     llm_price_per_1k_tokens: float = 0.0  # optional, for cost estimates
     sandbox_mode: str = "auto"          # auto | docker | local
@@ -81,7 +81,7 @@ class Settings:
             llm_provider=(e("P2P_LLM_PROVIDER") or "auto").lower(),
             llm_model=(e("P2P_LLM_MODEL") or DEFAULT_MODEL).strip(),
             llm_api_key=key,
-            llm_timeout_s=_int("P2P_LLM_TIMEOUT_S", 30),
+            llm_timeout_s=_int("P2P_LLM_TIMEOUT_S", 60),
             llm_max_retries=_int("P2P_LLM_MAX_RETRIES", 1),
             llm_price_per_1k_tokens=_float("P2P_LLM_PRICE_PER_1K", 0.0),
             sandbox_mode=(e("P2P_SANDBOX") or "auto").lower(),

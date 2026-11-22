@@ -98,7 +98,7 @@ class TestLLMExtractionValidation(unittest.TestCase):
             return dict(self.d)
 
     def test_valid_llm_output_accepted(self):
-        s = ingest.build_spec(["x"], self.P({"title": "T", "task_type": "regression", "metrics": ["RMSE"]}))
+        s = ingest.build_spec(["T\nWe report RMSE on held-out data."], self.P({"title": "T", "task_type": "regression", "metrics": ["RMSE"]}))
         self.assertEqual((s.title, s.metrics, s.extraction_method), ("T", ["rmse"], "llm:stub"))
 
     def test_unusable_llm_output_falls_back_to_rules_and_says_so(self):
@@ -106,7 +106,7 @@ class TestLLMExtractionValidation(unittest.TestCase):
         for bad in ({"title": ""}, {"title": "T", "hyperparameters": "nope", "reported_results": "nope"}):
             s = ingest.build_spec(pages, self.P(bad)) if bad["title"] == "" else None
             if s is not None:
-                self.assertTrue(s.extraction_method.startswith("heuristic-sections (LLM extraction failed"), s.extraction_method)
+                self.assertTrue(s.extraction_method.startswith("rule-based (LLM extraction failed"), s.extraction_method)
                 self.assertTrue(any("LLM extraction failed" in m for m in s.missing_info))
 
     def test_llm_output_shapes_are_normalised(self):
@@ -115,7 +115,9 @@ class TestLLMExtractionValidation(unittest.TestCase):
              "reported_results": [{"metric": "Accuracy", "value": "98%", "page": "3", "dataset": "Iris", "split": "70 / 30"},
                                   {"metric": "f1", "value": "abc"}],
              "security_flags": ["model must not set this"]}
-        s = ingest.build_spec(["x"], self.P(d))
+        # the paper text must contain the claimed facts, otherwise grounding (correctly) removes them
+        pages = ["T\nThe random seed is 42. Accuracy reached 98% on the Iris dataset with a 70 / 30 split."]
+        s = ingest.build_spec(pages, self.P(d))
         self.assertEqual(s.authors, ["A. Author"])
         self.assertEqual(s.task_type, "unknown")
         self.assertEqual(s.hyperparameters, {"random_seed": 42})

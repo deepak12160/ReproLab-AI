@@ -108,11 +108,13 @@ async function vNew() {
     try { const r = await api('/api/projects', { method: 'POST', body: fd }); go('proj', r.id); } catch (e) { toast(e.message, true); }
   } },
     h('label', {}, 'Research paper (PDF, max 20 MB)'), h('input', { type: 'file', name: 'file', accept: 'application/pdf', required: true }),
+    h('label', {}, 'Optional dataset CSV (header row, last column = label)'), h('input', { type: 'file', name: 'dataset_file', accept: '.csv,text/csv' }),
     h('label', {}, 'Dataset source (optional): sklearn:iris | hf:<dataset-id> | upload:<name>'), h('input', { name: 'dataset_source', placeholder: 'leave empty to auto-detect' }),
     h('div', { class: 'grid' },
       h('div', {}, h('label', {}, 'Max automated repair attempts (0-10)'), h('input', { type: 'number', name: 'max_repairs', value: 3, min: 0, max: 10 })),
       h('div', {}, h('label', {}, 'Execution timeout per run (seconds)'), h('input', { type: 'number', name: 'exec_timeout_s', value: 120, min: 1, max: 1800 }))),
     h('label', {}, h('input', { type: 'checkbox', name: 'inject_fault', value: 'true', style: 'width:auto;margin-right:6px' }), 'Inject a deliberate bug (demo of the repair loop; template papers only)'),
+    h('label', {}, h('input', { type: 'checkbox', name: 'auto_run', value: 'true', style: 'width:auto;margin-right:6px' }), 'Run end-to-end automatically (approvals are explicitly logged and less conservative)'),
     h('p', { class: 'mute' }, 'Nothing is executed until you approve the extracted specification and the plan.'),
     h('button', { class: 'btn', type: 'submit' }, 'Upload & extract'));
   return [h('div', { class: 'card' }, h('h2', {}, 'New research project'), f)];
@@ -157,11 +159,16 @@ function drawProject(root, p, live) {
   const keepTab = root.dataset.tab || 'spec';
   root.replaceChildren();
   root.append(h('div', { class: 'row', style: 'margin-bottom:10px' }, h('h2', { style: 'margin:0' }, p.name), statusPill({ status: p.status, reproduction_status: st.reproduction_status }),
-    h('span', { class: 'pill' }, st.mode === 'demo' ? 'DEMO MODE – no LLM' : 'LLM: ' + ((st.llm_info || {}).model || 'on')),
+    h('span', { class: 'pill ' + (st.mode === 'demo' ? 'warn' : 'ok') }, st.mode === 'demo' ? 'DEMO MODE – no LLM' : 'LLM MODE – ' + ((st.llm_info || {}).provider || '?') + ' / ' + ((st.llm_info || {}).model || '?')),
+    st.auto_run ? h('span', { class: 'pill warn' }, 'AUTO-RUN – approvals not person-reviewed') : null,
+    st.is_fixture ? h('span', { class: 'pill warn' }, 'SYNTHETIC DEMO FIXTURE – not a real paper') : null,
     st.sandbox ? h('span', { class: 'pill ' + (st.sandbox.isolated ? 'ok' : 'warn') }, 'sandbox: ' + st.sandbox.mode + (st.sandbox.isolated ? '' : ' (NOT isolated)')) : null,
-    h('span', { class: 'sp' }), !['completed', 'failed', 'blocked', 'cancelled'].includes(p.status) ? h('button', { class: 'btn bad', onclick: () => post(`/api/projects/${p.id}/cancel`).then(() => toast('Cancel requested')).catch(e => toast(e.message, true)) }, 'Stop / cancel') : null));
+    h('span', { class: 'sp' }),
+    p.status === 'failed' && st.codegen_partial ? h('button', { class: 'btn', onclick: () => post(`/api/projects/${p.id}/resume`).then(() => toast('Resume started')).catch(e => toast(e.message, true)) }, 'Resume') : null,
+    !['completed', 'failed', 'blocked', 'cancelled'].includes(p.status) ? h('button', { class: 'btn bad', onclick: () => post(`/api/projects/${p.id}/cancel`).then(() => toast('Cancel requested')).catch(e => toast(e.message, true)) }, 'Stop / cancel') : null));
   root.append(stageBar(p.status));
   if (st.sandbox && !st.sandbox.isolated) root.append(h('div', { class: 'banner' }, st.sandbox.note));
+  (st.degraded || []).forEach(d => root.append(h('div', { class: 'banner' }, 'Degraded step: ' + d)));
   if (st.blocked_reason) root.append(h('div', { class: 'banner', style: 'color:var(--bad);border-color:var(--bad)' }, 'Stopped: ' + st.blocked_reason));
   if (p.status === 'awaiting_spec_approval') root.append(specGate(p));
   if (p.status === 'awaiting_plan_approval') root.append(planGate(p));
@@ -171,37 +178,80 @@ function drawProject(root, p, live) {
   const body = h('div', {});
   const bar = h('div', { class: 'row', style: 'margin-bottom:10px' }, tabs.map(([k, l]) => h('button', { class: 'btn ' + (k === keepTab ? '' : 'sec'), onclick: () => { root.dataset.tab = k; drawProject(root, p, live); } }, l)));
   root.append(bar, body);
-  ({ spec: tSpec, code: tCode, exp: tExp, rep: tRep }[keepTab])(body, p);
+  try {
+    const rendered = ({ spec: tSpec, code: tCode, exp: tExp, rep: tRep }[keepTab] || tSpec)(body, p);
+    if (rendered && typeof rendered.catch === 'function') {
+      rendered.catch(e => body.replaceChildren(h('div', { class: 'banner', style: 'color:var(--bad);border-color:var(--bad)' }, 'Tab error: ' + (e && e.message ? e.message : String(e)))));
+    }
+  } catch (e) {
+    body.replaceChildren(h('div', { class: 'banner', style: 'color:var(--bad);border-color:var(--bad)' }, 'Tab error: ' + (e && e.message ? e.message : String(e))));
+  }
+}
+const PROV = { explicit: 'stated in paper', derived: 'derived from paper', user_provided: 'user-provided', assumed: 'assumed', not_reported: 'NOT REPORTED' };
+function provChip(s, k) { const v = (s.provenance || {})[k] || 'not_reported'; return h('span', { class: 'pill ' + (v === 'not_reported' ? 'warn' : v === 'user_provided' ? 'ok' : ''), style: 'margin-left:6px;font-size:11px' }, PROV[v] || v); }
+function evidenceList(s, field) {
+  const ev = (s.evidence || []).filter(e => e.field === field);
+  return ev.length ? h('details', {}, h('summary', { class: 'mute' }, `evidence (${ev.length})`), h('ul', {}, ev.map(e => h('li', { class: 'mute' }, `${e.key}: "${e.excerpt || '(' + (PROV[e.label] || e.label) + ')'}"${e.page ? ' – p.' + e.page : ''} [${PROV[e.label] || e.label}]`)))) : null;
 }
 function specGate(p) {
-  const s = p.state.spec; const ta = (v) => h('textarea', {}, v);
-  const hp = ta(JSON.stringify(s.hyperparameters, null, 2)), ds = ta(s.datasets.join('\n')), rr = ta(JSON.stringify(s.reported_results, null, 2));
+  const s = p.state.spec; const ta = (v, rows) => h('textarea', { rows: rows || 5 }, v);
+  const hp = ta(JSON.stringify(s.hyperparameters, null, 2)), ds = ta(s.datasets.join('\n')), rr = ta(JSON.stringify(s.reported_results.map(({ metric, value, dataset, split, page, variant }) => ({ metric, value, dataset, split, page, variant })), null, 2), 8),
+    me = ta(s.method, 4), mt = ta(s.metrics.join('\n'), 4);
   return h('div', { class: 'card' }, h('h2', {}, 'Review & correct the extracted specification'),
+    h('p', { class: 'mute' }, 'Datasets must be dataset names only; metric names go in Metrics. Values you change are saved, labelled "user-provided" and used by every later step. Anything the paper does not state stays "NOT REPORTED" - do not guess.'),
     s.security_flags.length ? h('div', { class: 'banner' }, `Security: ${s.security_flags.length} prompt-injection pattern(s) were detected in the PDF. They are treated as data and will never be obeyed.`) : null,
     s.missing_info.length ? h('div', { class: 'banner' }, 'Missing in paper: ' + s.missing_info.join('; ')) : null,
-    h('div', { class: 'grid' }, h('div', {}, h('label', {}, 'Hyperparameters (JSON)'), hp), h('div', {}, h('label', {}, 'Datasets (one per line)'), ds), h('div', {}, h('label', {}, 'Reported results (JSON)'), rr)),
+    (s.validation_issues || []).length ? h('div', { class: 'banner' }, 'Automatic corrections: ' + s.validation_issues.join(' | ')) : null,
+    h('div', { class: 'grid' },
+      h('div', {}, h('label', {}, 'Method', provChip(s, 'method')), me, evidenceList(s, 'method')),
+      h('div', {}, h('label', {}, 'Datasets (names only, one per line)', provChip(s, 'datasets')), ds, evidenceList(s, 'datasets')),
+      h('div', {}, h('label', {}, 'Metrics (one per line)', provChip(s, 'metrics')), mt),
+      h('div', {}, h('label', {}, 'Hyperparameters (JSON, only values from the paper)', provChip(s, 'hyperparameters')), hp, evidenceList(s, 'hyperparameters')),
+      h('div', {}, h('label', {}, 'Reported results (JSON: metric + value pairs)', provChip(s, 'reported_results')), rr, evidenceList(s, 'reported_results'))),
     h('div', { class: 'row', style: 'margin-top:12px' }, h('button', { class: 'btn', onclick: async () => {
-      try { await post(`/api/projects/${p.id}/approve-spec`, { edits: { hyperparameters: JSON.parse(hp.value), datasets: ds.value.split('\n').map(x => x.trim()).filter(Boolean), reported_results: JSON.parse(rr.value) } }); go('proj', p.id); }
-      catch (e) { toast(e.message, true); } } }, 'Approve specification & plan')));
+      try {
+        await post(`/api/projects/${p.id}/approve-spec`, { edits: { method: me.value.trim(), hyperparameters: JSON.parse(hp.value), datasets: ds.value.split('\n').map(x => x.trim()).filter(Boolean),
+          metrics: mt.value.split('\n').map(x => x.trim()).filter(Boolean), reported_results: JSON.parse(rr.value) } }); go('proj', p.id);
+      } catch (e) { toast(e.message, true); } } }, 'Approve specification & plan')));
 }
 function planGate(p) {
   const pl = p.state.plan; const cb = h('input', { type: 'checkbox', style: 'width:auto;margin-right:6px' });
+  const src = h('input', { placeholder: 'sklearn:wine | sklearn:iris | sklearn:breast_cancer | sklearn:digits' }), up = h('input', { type: 'file', accept: '.csv' });
+  const blocked = (pl.blockers || []).length > 0;
   return h('div', { class: 'card' }, h('h2', {}, 'Approve implementation plan (grants execution permission)'),
-    h('p', {}, pl.approach), h('table', {}, pl.tasks.map(t => h('tr', {}, h('td', {}, t.id), h('td', {}, t.title), h('td', { class: 'mute' }, 'depends: ' + (t.depends_on.join(', ') || '–'))))),
-    h('p', {}, h('b', {}, 'Risks: '), pl.risks.join(' · ')), h('p', {}, h('b', {}, 'Compute: '), pl.compute),
+    h('p', {}, pl.approach),
+    h('p', {}, h('b', {}, 'Reproduction type: '), (pl.reproduction_type || '?').toUpperCase(), ' – ', pl.reproduction_type_reason || ''),
+    h('table', {}, pl.tasks.map(t => h('tr', {}, h('td', {}, t.id), h('td', {}, t.title), h('td', { class: 'mute' }, 'depends: ' + (t.depends_on.join(', ') || '–'))))),
+    h('p', {}, h('b', {}, 'Risks: '), pl.risks.join(' · ')), h('p', {}, h('b', {}, 'Compute: '), pl.compute_needs || pl.compute),
+    h('p', {}, h('b', {}, 'Dataset: '), (pl.dataset_requirements || []).join('; ')),
+    blocked ? h('div', { class: 'banner', style: 'color:var(--bad);border-color:var(--bad)' }, 'Blockers (resolve before approving): ' + pl.blockers.join(' | ')) : null,
+    h('div', { class: 'grid' },
+      h('div', {}, h('label', {}, 'Choose a dataset source (a different dataset than the paper\'s becomes an assumption you must accept)'), src,
+        h('button', { class: 'btn sec', style: 'margin-top:6px', onclick: async () => { try { await post(`/api/projects/${p.id}/dataset`, { source: src.value.trim() }); go('proj', p.id); } catch (e) { toast(e.message, true); } } }, 'Use this dataset')),
+      h('div', {}, h('label', {}, 'Or upload your own CSV (header row, last column = label)'), up,
+        h('button', { class: 'btn sec', style: 'margin-top:6px', onclick: async () => {
+          if (!up.files[0]) return toast('Choose a CSV file first', true);
+          const fd = new FormData(); fd.append('file', up.files[0]);
+          try { const r = await fetch(`/api/projects/${p.id}/dataset-upload`, { method: 'POST', body: fd }); const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); go('proj', p.id); } catch (e) { toast(e.message, true); } } }, 'Upload dataset'))),
     h('h2', {}, 'Assumptions you must accept'), h('ul', {}, pl.assumptions.map(a => h('li', {}, a))),
     h('label', { style: 'color:var(--ink)' }, cb, 'I accept these assumptions and allow the generated code to run in the sandbox'),
-    h('button', { class: 'btn', onclick: async () => { try { await post(`/api/projects/${p.id}/approve-plan`, { accept_assumptions: cb.checked }); go('proj', p.id); } catch (e) { toast(e.message, true); } } }, 'Approve & run'));
+    h('button', { class: 'btn', disabled: blocked, onclick: async () => { try { await post(`/api/projects/${p.id}/approve-plan`, { accept_assumptions: cb.checked }); go('proj', p.id); } catch (e) { toast(e.message, true); } } }, 'Approve & run'));
 }
 function tSpec(body, p) {
   const s = p.state.spec; if (!s) return body.append(h('div', { class: 'card mute' }, 'Specification not extracted yet.'));
-  const row = (k, v, pg) => h('tr', {}, h('th', {}, k), h('td', {}, v), h('td', { class: 'mute' }, pg ? 'p.' + pg.join(',') : ''));
-  body.append(h('div', { class: 'card' }, h('table', {}, row('Title', s.title), row('Authors', s.authors.join(', ')), row('Method', s.method, s.page_refs.method), row('Equations', s.equations.join(' | '), s.page_refs.equations),
-    row('Datasets', s.datasets.join('; '), s.page_refs.datasets), row('Hyperparameters', JSON.stringify(s.hyperparameters), s.page_refs.hyperparameters), row('Metrics', s.metrics.join(', '), s.page_refs.metrics),
-    row('Reported', s.reported_results.map(r => `${r.metric}=${r.value} (${r.dataset || '?'}, ${r.split || 'split ?'})`).join('; '), s.page_refs.results), row('Extraction', s.extraction_method))));
+  const row = (k, v, pg, pk) => h('tr', {}, h('th', {}, k), h('td', {}, v || h('i', { class: 'mute' }, 'not reported'), pk ? provChip(s, pk) : null), h('td', { class: 'mute' }, pg ? 'p.' + pg.join(',') : ''));
+  body.append(h('div', { class: 'card' }, h('table', {}, row('Title', s.title), row('Authors', s.authors.join(', ')), row('Method', s.method, s.page_refs.method, 'method'), row('Equations', s.equations.join(' | '), s.page_refs.equations),
+    row('Datasets', s.datasets.join('; '), s.page_refs.datasets, 'datasets'), row('Hyperparameters', Object.keys(s.hyperparameters).length ? JSON.stringify(s.hyperparameters) : '', s.page_refs.hyperparameters, 'hyperparameters'), row('Metrics', s.metrics.join(', '), s.page_refs.metrics, 'metrics'),
+    row('Reported', s.reported_results.map(r => `${r.metric}=${r.value} (${r.dataset || '?'}, ${r.split || 'split ?'})`).join('; '), s.page_refs.results, 'reported_results'), row('Missing', (s.missing_info || []).join('; ') || 'nothing flagged'), row('Extraction', s.extraction_method))));
 }
 async function tCode(body, p) {
-  if (!p.state.files.length) return body.append(h('div', { class: 'card mute' }, 'No files generated yet.'));
+  if (!p.state.files.length) {
+    let msg = 'No files generated yet.';
+    if (p.state.blocked_reason) msg = 'Code cannot be generated: ' + p.state.blocked_reason;
+    else if (['failed', 'cancelled'].includes(p.status)) msg = 'Code generation stopped because the project ' + p.status + '.';
+    else if (['awaiting_spec_approval', 'awaiting_plan_approval'].includes(p.status)) msg = 'Code generation is waiting for approval.';
+    return body.append(h('div', { class: 'card mute' }, msg));
+  }
   const f = await api(`/api/projects/${p.id}/files`), view = h('pre', { class: 'code' }, 'Select a file');
   const tree = h('div', { class: 'tree' }, f.files.map(x => h('div', { onclick: async ev => { [...tree.children].forEach(c => c.classList.remove('on')); ev.target.classList.add('on'); view.textContent = await api(`/api/projects/${p.id}/file?path=${encodeURIComponent(x)}`); } }, x)));
   body.append(h('div', { class: 'card' }, h('div', { class: 'row' }, h('h2', {}, 'Generated project (read-only)'), h('span', { class: 'sp' }),
@@ -211,13 +261,31 @@ async function tCode(body, p) {
 }
 function tExp(body, p) {
   const s = p.state, m = s.metrics;
-  if (!m) return body.append(h('div', { class: 'card mute' }, 'No measured metrics yet.'));
-  const bars = ['accuracy', 'precision', 'recall', 'f1'].map(k => h('div', { style: 'margin:6px 0' }, h('div', { class: 'row' }, k + ' (macro)'.replace(' (macro)', k === 'accuracy' ? '' : ' (macro)'), h('span', { class: 'sp' }, m[k].toFixed(4))), h('div', { class: 'bar' }, h('i', { style: `width:${(m[k] * 100).toFixed(1)}%` }))));
-  const cm = h('table', { class: 'cm' }, h('tr', {}, h('th', {}, 'true \\ pred'), m.labels.map(l => h('th', {}, l))), m.confusion_matrix.map((r, i) => h('tr', {}, h('th', {}, m.labels[i]), r.map(v => h('td', { style: `background:rgba(79,70,229,${Math.min(0.15 + v / 20, 0.85)})` }, v)))));
+  if (!m) {
+    let msg = 'No measured metrics yet.';
+    if (s.blocked_reason) msg = 'Experiment cannot run: ' + s.blocked_reason;
+    else if (['failed', 'cancelled'].includes(p.status)) msg = 'Experiment stopped because the project ' + p.status + '.';
+    else if (['awaiting_spec_approval', 'awaiting_plan_approval'].includes(p.status)) msg = 'Experiment is waiting for specification and plan approval.';
+    return body.append(h('div', { class: 'card mute' }, msg));
+  }
+  const fmt = v => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(4) : '–');
+  const bars = m.task === 'regression'
+    ? ['mae', 'mse', 'rmse', 'r2'].filter(k => m[k] != null).map(k => h('div', { style: 'margin:6px 0' }, h('div', { class: 'row' }, k.toUpper(), h('span', { class: 'sp' }, fmt(m[k])))))
+    : ['accuracy', 'precision', 'recall', 'f1', 'balanced_accuracy', 'g_mean', 'youden_j', 'specificity', 'mcc']
+        .filter(k => typeof m[k] === 'number').map(k => h('div', { style: 'margin:6px 0' }, h('div', { class: 'row' }, k + (['precision', 'recall', 'f1'].includes(k) ? ' (macro)' : ''), h('span', { class: 'sp' }, fmt(m[k]))),
+          h('div', { class: 'bar' }, h('i', { style: `width:${(Math.max(0, Math.min(1, m[k])) * 100).toFixed(1)}%` }))));
+  let cm = null;
+  if (Array.isArray(m.labels) && Array.isArray(m.confusion_matrix)) {
+    cm = h('table', { class: 'cm' },
+      h('tr', {}, h('th', {}, 'true \\ pred'), m.labels.map(l => h('th', {}, l))),
+      m.confusion_matrix.map((r, i) => h('tr', {}, h('th', {}, m.labels[i]),
+        (Array.isArray(r) ? r : []).map(v => h('td', { style: `background:rgba(79,70,229,${Math.min(0.15 + v / 20, 0.85)})` }, v)))));
+  }
   const ds = s.dataset || {}, meta = s.run_meta || {};
   body.append(h('div', { class: 'grid' },
     h('div', { class: 'card' }, h('h2', {}, `Measured metrics (n=${m.n}, computed independently)`), bars, s.script_metric_check ? h('div', { class: 'mute' }, 'Cross-check: ' + s.script_metric_check) : null),
-    h('div', { class: 'card' }, h('h2', {}, 'Confusion matrix'), cm),
+    h('div', { class: 'card' }, h('h2', {}, m.task === 'regression' ? 'Metric details' : 'Confusion matrix'),
+      cm || h('div', { class: 'mute' }, m.task === 'regression' ? 'Regression has no confusion matrix.' : 'Confusion matrix unavailable.')),
     h('div', { class: 'card' }, h('h2', {}, 'Run & dataset details'), h('table', {}, [['Dataset', `${ds.name} (${ds.source})`], ['Version', ds.version], ['License', ds.license], ['Seed', meta.seed], ['Test fraction', meta.test_size], ['Runtime', (meta.runtime_s ?? '?') + ' s'], ['Python', (meta.environment || {}).python], ['NumPy', (meta.environment || {}).numpy], ['scikit-learn', (meta.environment || {}).scikit_learn]].map(([a, b]) => h('tr', {}, h('th', {}, a), h('td', {}, b ?? '–')))))));
   const comparisonCard = h('div', { class: 'card' }, h('h2', {}, 'Reported vs reproduced'));
   if (Array.isArray(s.comparisons) && s.comparisons.length) {
@@ -247,7 +315,13 @@ function tExp(body, p) {
   body.append(comparisonCard);
 }
 async function tRep(body, p) {
-  if (!p.state.manifest) return body.append(h('div', { class: 'card mute' }, 'Report not generated yet.'));
+  if (!p.state.manifest) {
+    let msg = 'Report not generated yet.';
+    if (p.state.blocked_reason) msg = 'Report cannot be generated: ' + p.state.blocked_reason;
+    else if (['failed', 'cancelled'].includes(p.status)) msg = 'Report generation stopped because the project ' + p.status + '.';
+    else if (['awaiting_spec_approval', 'awaiting_plan_approval'].includes(p.status)) msg = 'Report is waiting for specification and plan approval.';
+    return body.append(h('div', { class: 'card mute' }, msg));
+  }
   const md = await api(`/api/projects/${p.id}/report`);
   body.append(h('div', { class: 'card' }, h('div', { class: 'row' }, h('h2', {}, 'Final report'), h('span', { class: 'sp' }),
     h('a', { href: `/api/projects/${p.id}/report` }, h('button', { class: 'btn sec' }, 'Download report.md')),
@@ -270,7 +344,7 @@ $('#testllm').addEventListener('click', async () => {
 });
 (async () => {
   nav(); render();
-  try { integ = await api('/api/integrations'); const c = $('#modechip'); c.textContent = integ.llm.configured ? 'LLM: ' + integ.llm.model : 'DEMO MODE (no LLM key)'; c.className = 'pill ' + (integ.llm.configured ? 'ok' : 'warn'); c.title = JSON.stringify(integ, null, 1); } catch (e) { }
+  try { integ = await api('/api/integrations'); const c = $('#modechip'); c.textContent = integ.llm.label || (integ.llm.configured ? 'LLM MODE' : 'DEMO MODE (no LLM key)'); c.className = 'pill ' + (integ.llm.configured ? 'ok' : 'warn'); c.title = JSON.stringify(integ, null, 1); } catch (e) { }
 })();
 </script>
 </body>

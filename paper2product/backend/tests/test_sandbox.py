@@ -5,7 +5,7 @@ from app.sandbox import LocalSandbox, SandboxResult
 
 def run(script, **kw):
     d = tempfile.mkdtemp()
-    with open(os.path.join(d, "t.py"), "w") as f:
+    with open(os.path.join(d, "t.py"), "w", encoding="utf-8") as f:
         f.write(script)
     args = dict(timeout_s=5, memory_mb=512, max_output_kb=64); args.update(kw)
     return LocalSandbox().run_python(d, ["t.py"], **args)

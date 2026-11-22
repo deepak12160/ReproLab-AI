@@ -3,7 +3,7 @@ from app import graph, codegen, repair
 from app.graph import S, GateError, InvalidTransition, check_transition
 from app.schemas import Budget, SchemaError
 from app.storage import Storage
-from .helpers import make_engine, sample_pdf, drive, StubProvider
+from .helpers import make_pdf, WINE_PAPER, make_engine, sample_pdf, drive, StubProvider
 
 
 class TestStateMachine(unittest.TestCase):
@@ -17,7 +17,10 @@ class TestStateMachine(unittest.TestCase):
 
     def test_terminal_states_have_no_exits(self):
         for t in graph.TERMINAL:
-            self.assertEqual(graph.TRANSITIONS[t], set())
+            if t == graph.S.FAILED:
+                self.assertEqual(graph.TRANSITIONS[t], {graph.S.RESOLVING, graph.S.GENERATING})
+            else:
+                self.assertEqual(graph.TRANSITIONS[t], set())
 
     def test_execution_cannot_skip_approvals(self):
         e, s, db = make_engine()
@@ -161,7 +164,7 @@ class TestCancelAndBlocking(unittest.TestCase):
         e.approve_spec(pid, {"method": "A transformer with attention.", "datasets": ["mnist"]})
         e.run_plan(pid)
         self.assertEqual(e.status(pid), S.BLOCKED)
-        self.assertIn("Demo mode", e.load(pid).blocked_reason)
+        self.assertIn("DEMO MODE", e.load(pid).blocked_reason)
 
     def test_dataset_unavailable_blocks_with_instructions(self):
         e, s, db = make_engine()
@@ -290,7 +293,7 @@ class TestGenericLLMPipeline(unittest.TestCase):
 
     def test_non_template_paper_runs_end_to_end_with_llm_generated_code(self):
         e, s, db = make_engine(provider=self._stub())
-        pid = e.create("wine", sample_pdf(), Budget(), "sklearn:wine")
+        pid = e.create("wine", make_pdf(WINE_PAPER), Budget(), "sklearn:wine")
         drive(e, pid)
         st = e.load(pid)
         self.assertEqual(e.status(pid), S.COMPLETED, st.blocked_reason)
