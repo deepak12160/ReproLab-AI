@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "reprolab-ai",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "observability": { "enabled": true },
+
+  // The FastAPI app runs in a Cloudflare Container built from the existing Dockerfile.
+  // (Workers cannot run PyMuPDF / scikit-learn / SQLite / subprocess sandboxes.)
+  "containers": [
+    {
+      "class_name": "ReproLabContainer",
+      "image": "./paper2product/Dockerfile",
+      "instance_type": "standard-1",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "REPROLAB", "class_name": "ReproLabContainer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ReproLabContainer"] }]
+
+  // Secrets are NOT stored here. Set them with `npx wrangler secret put <NAME>`:
+  //   APP_PASSWORD (required - the gateway refuses to serve without it), GEMINI_API_KEY (optional),
+  //   P2P_API_KEY (optional, defaults to a derived value), GITHUB_TOKEN, HF_TOKEN (optional)
+}

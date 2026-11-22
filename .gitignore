@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+.wrangler-dryrun/
+.dev.vars
+.env
+paper2product/.env
+paper2product/data/
+paper2product/.venv/
+__pycache__/
+*.pyc

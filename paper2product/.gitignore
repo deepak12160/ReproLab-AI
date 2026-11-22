@@ -1,0 +1,28 @@
+# secrets
+.env
+*.key
+
+# runtime data
+data/
+demo_output/
+*.db
+*.sqlite3
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.venv-python314-failed/
